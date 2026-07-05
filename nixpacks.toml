@@ -1,14 +1,19 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip"]
+nixPkgs = ["python311", "python311Packages.pip", "python311Packages.virtualenv"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[phases.start]
-cmd = "python bot.py"
+cmds = [
+  "python -m venv .venv",
+  ". .venv/bin/activate",
+  "pip install --upgrade pip",
+  "pip install -r requirements.txt"
+]
 
 [phases.build]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  ". .venv/bin/activate",
+  "pip install -r requirements.txt"
+]
 
-[phases.deploy]
-start = "python bot.py"
+[phases.start]
+cmd = ". .venv/bin/activate && python bot.py"
