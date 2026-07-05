@@ -3,8 +3,8 @@ import json
 import logging
 import asyncio
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 import openai
 import requests
@@ -23,10 +23,21 @@ logger = logging.getLogger(__name__)
 # API Keys
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-DICTIONARY_API_KEY = os.getenv('DICTIONARY_API_KEY')  # Optional
+
+# Validate API keys
+if not TELEGRAM_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not set! Please set it in environment variables.")
+    exit(1)
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY not set! Please set it in environment variables.")
+    exit(1)
 
 # Initialize OpenAI
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+try:
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    exit(1)
 
 # Dictionary API endpoints
 DICTIONARY_API = "https://api.dictionaryapi.dev/api/v2/entries/en/"
@@ -35,6 +46,7 @@ SYNONYM_API = "https://api.datamuse.com/words"
 # User states
 STATE_IDLE, STATE_DEFINE, STATE_ASK = range(3)
 user_states = {}
+user_history = {}
 
 class DictionaryBot:
     def __init__(self):
@@ -47,12 +59,11 @@ class DictionaryBot:
             '/examples': 'Get example sentences',
             '/history': 'View your recent queries',
             '/stats': 'View bot statistics',
-            '/language': 'Change language preference'
         }
-        self.user_history = {}
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a welcome message when /start is issued."""
+        user_id = update.effective_user.id
         welcome_message = (
             f"👋 Hello {update.effective_user.first_name}! I'm your Dictionary AI Bot.\n\n"
             "I can help you with:\n"
@@ -66,9 +77,8 @@ class DictionaryBot:
         await update.message.reply_text(welcome_message)
         
         # Initialize user history
-        user_id = update.effective_user.id
-        if user_id not in self.user_history:
-            self.user_history[user_id] = []
+        if user_id not in user_history:
+            user_history[user_id] = []
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send a help message when /help is issued."""
@@ -87,7 +97,6 @@ class DictionaryBot:
         """Define a word using dictionary API."""
         user_id = update.effective_user.id
         
-        # Check if word is provided
         if context.args:
             word = ' '.join(context.args)
         else:
@@ -95,7 +104,6 @@ class DictionaryBot:
             user_states[user_id] = STATE_DEFINE
             return
         
-        # Check if we have a specific word and not in waiting state
         if user_id in user_states and user_states[user_id] == STATE_DEFINE:
             word = ' '.join(context.args)
             if not word:
@@ -103,27 +111,30 @@ class DictionaryBot:
                 return
             user_states[user_id] = STATE_IDLE
         
-        # Get definition
         definition = await self.get_definition(word)
         
         if definition:
-            # Save to history
-            if user_id not in self.user_history:
-                self.user_history[user_id] = []
-            self.user_history[user_id].append({
+            if user_id not in user_history:
+                user_history[user_id] = []
+            user_history[user_id].append({
                 'word': word,
                 'type': 'definition',
                 'timestamp': datetime.now().isoformat()
             })
             
-            await update.message.reply_text(definition, parse_mode='Markdown')
+            # Split long messages if needed
+            if len(definition) > 4000:
+                for i in range(0, len(definition), 4000):
+                    await update.message.reply_text(definition[i:i+4000], parse_mode='Markdown')
+            else:
+                await update.message.reply_text(definition, parse_mode='Markdown')
         else:
             await update.message.reply_text(f"Sorry, I couldn't find a definition for '{word}'. Please check the spelling.")
 
     async def get_definition(self, word):
         """Fetch definition from dictionary API."""
         try:
-            response = requests.get(f"{DICTIONARY_API}{word}")
+            response = requests.get(f"{DICTIONARY_API}{word}", timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 
@@ -132,9 +143,9 @@ class DictionaryBot:
                     
                 result = f"📚 *Definition of '{word}'*\n\n"
                 
-                for entry in data[:2]:  # Limit to first 2 entries
+                for entry in data[:2]:
                     if 'meanings' in entry:
-                        for meaning in entry['meanings'][:2]:  # Limit to first 2 meanings
+                        for meaning in entry['meanings'][:2]:
                             part_of_speech = meaning.get('partOfSpeech', 'unknown')
                             result += f"*{part_of_speech}*\n"
                             
@@ -163,7 +174,6 @@ class DictionaryBot:
             user_states[user_id] = STATE_ASK
             return
         
-        # Check if we have a specific question
         if user_id in user_states and user_states[user_id] == STATE_ASK:
             question = ' '.join(context.args)
             if not question:
@@ -171,22 +181,23 @@ class DictionaryBot:
                 return
             user_states[user_id] = STATE_IDLE
         
-        # Send typing indicator
         await update.message.chat.send_action(action="typing")
-        
-        # Get AI response
         response = await self.get_ai_response(question)
         
-        # Save to history
-        if user_id not in self.user_history:
-            self.user_history[user_id] = []
-        self.user_history[user_id].append({
+        if user_id not in user_history:
+            user_history[user_id] = []
+        user_history[user_id].append({
             'question': question[:50],
             'type': 'question',
             'timestamp': datetime.now().isoformat()
         })
         
-        await update.message.reply_text(response)
+        # Split long responses
+        if len(response) > 4000:
+            for i in range(0, len(response), 4000):
+                await update.message.reply_text(response[i:i+4000])
+        else:
+            await update.message.reply_text(response)
 
     async def get_ai_response(self, question):
         """Get response from OpenAI."""
@@ -194,7 +205,7 @@ class DictionaryBot:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that defines words and answers questions."},
+                    {"role": "system", "content": "You are a helpful assistant that defines words and answers questions concisely."},
                     {"role": "user", "content": question}
                 ],
                 max_tokens=500,
@@ -210,9 +221,9 @@ class DictionaryBot:
         user_id = update.effective_user.id
         message_text = update.message.text
         
-        # Check if user is in a waiting state
         if user_id in user_states:
             if user_states[user_id] == STATE_DEFINE:
+                context.args = [message_text]
                 await self.define_word(update, context)
                 return
             elif user_states[user_id] == STATE_ASK:
@@ -221,14 +232,12 @@ class DictionaryBot:
                 return
         
         # Auto-detect intent
-        # If it's a simple word (single word), try to define it
         if len(message_text.split()) <= 3 and not message_text.endswith('?'):
             definition = await self.get_definition(message_text)
             if definition:
                 await update.message.reply_text(definition, parse_mode='Markdown')
                 return
         
-        # Otherwise, treat as a question for AI
         await update.message.chat.send_action(action="typing")
         response = await self.get_ai_response(message_text)
         await update.message.reply_text(response)
@@ -242,7 +251,7 @@ class DictionaryBot:
         word = ' '.join(context.args)
         
         try:
-            response = requests.get(f"{SYNONYM_API}?rel_syn={word}")
+            response = requests.get(f"{SYNONYM_API}?rel_syn={word}", timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if data:
@@ -267,7 +276,7 @@ class DictionaryBot:
         word = ' '.join(context.args)
         
         try:
-            response = requests.get(f"{DICTIONARY_API}{word}")
+            response = requests.get(f"{DICTIONARY_API}{word}", timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 examples = []
@@ -295,12 +304,12 @@ class DictionaryBot:
         """Show user's query history."""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_history or not self.user_history[user_id]:
+        if user_id not in user_history or not user_history[user_id]:
             await update.message.reply_text("You have no query history yet.")
             return
         
         history_text = "📜 *Your Recent Queries:*\n\n"
-        for i, item in enumerate(self.user_history[user_id][-10:], 1):
+        for i, item in enumerate(user_history[user_id][-10:], 1):
             if item['type'] == 'definition':
                 history_text += f"{i}. 📚 '{item['word']}'\n"
             else:
@@ -311,32 +320,25 @@ class DictionaryBot:
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot statistics."""
         user_id = update.effective_user.id
-        total_queries = len(self.user_history.get(user_id, []))
+        total_queries = len(user_history.get(user_id, []))
         
         stats_text = (
             f"📊 *Your Statistics*\n\n"
             f"Total queries: {total_queries}\n"
-            f"Definitions: {sum(1 for q in self.user_history.get(user_id, []) if q['type'] == 'definition')}\n"
-            f"Questions: {sum(1 for q in self.user_history.get(user_id, []) if q['type'] == 'question')}\n"
+            f"Definitions: {sum(1 for q in user_history.get(user_id, []) if q['type'] == 'definition')}\n"
+            f"Questions: {sum(1 for q in user_history.get(user_id, []) if q['type'] == 'question')}\n"
             f"Active since: {datetime.now().strftime('%Y-%m-%d')}"
         )
         
         await update.message.reply_text(stats_text, parse_mode='Markdown')
 
-    async def language(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Change language preference."""
-        # This is a placeholder - you can add multi-language support
-        await update.message.reply_text(
-            "Currently only English is supported.\n"
-            "Multi-language support will be added soon!"
-        )
-
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors."""
         logger.error(f"Update {update} caused error {context.error}")
-        await update.message.reply_text("An error occurred. Please try again later.")
+        if update and update.effective_message:
+            await update.effective_message.reply_text("An error occurred. Please try again later.")
 
-def main():
+async def main():
     """Start the bot."""
     # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -352,7 +354,6 @@ def main():
     application.add_handler(CommandHandler("examples", bot.examples))
     application.add_handler(CommandHandler("history", bot.history))
     application.add_handler(CommandHandler("stats", bot.stats))
-    application.add_handler(CommandHandler("language", bot.language))
     
     # Add message handler for non-command messages
     application.add_handler(MessageHandler(
@@ -364,8 +365,27 @@ def main():
     application.add_error_handler(bot.error_handler)
     
     # Start the bot
-    print("🤖 Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🤖 Bot is starting...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # Keep the bot running
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down bot...")
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        exit(1)
